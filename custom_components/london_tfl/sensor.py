@@ -24,10 +24,8 @@ from .network import request
 from .tfl_data import TfLData
 from .hasl_utils import as_hasl_departures
 
-
 _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(minutes=1)
-
 
 CONFIG_STOP = vol.Schema({
     vol.Required(CONF_LINE): cv.string,
@@ -43,7 +41,6 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_STOPS): vol.All(cv.ensure_list, [CONFIG_STOP]),
 })
 
-
 async def async_setup_entry(
     hass: core.HomeAssistant,
     config_entry: config_entries.ConfigEntry,
@@ -51,10 +48,8 @@ async def async_setup_entry(
 ):
     """Setup sensors from a config entry created in the integrations UI."""
     config = hass.data[DOMAIN][config_entry.entry_id]
-
     name = config[CONF_NAME] if CONF_NAME in config else DEFAULT_NAME
     stops = config[CONF_STOPS]
-
     sensors = []
     for stop in stops:
         if stop[CONF_STATION] is not None and stop[CONF_LINE] is not None:
@@ -75,7 +70,6 @@ async def async_setup_entry(
             )
     async_add_entities(sensors, update_before_add=True)
 
-
 async def async_setup_platform(
     hass: HomeAssistant,
     config: ConfigType,
@@ -85,7 +79,6 @@ async def async_setup_platform(
     """Set up the sensor platform."""
     name = config.get(CONF_NAME)
     stops = config.get(CONF_STOPS)
-
     sensors = []
     for stop in stops:
         if stop[CONF_STATION] is not None and stop[CONF_LINE] is not None:
@@ -101,7 +94,6 @@ async def async_setup_platform(
                 )
             )
     async_add_entities(sensors, update_before_add=True)
-
 
 class LondonTfLSensor(SensorEntity):
     """Representation of a Sensor."""
@@ -178,6 +170,8 @@ class LondonTfLSensor(SensorEntity):
                 str(uuid.uuid4())
             )
 
+        # CHANGED/DEFENSIVE: Wrap in broad try/except, handle empty result and JSON parsing error,
+        #   and defensively avoid updating stale state.
         if self._tfl_data.is_data_stale(self.max_items):
             try:
                 result = await request(url_base, self)
@@ -185,14 +179,19 @@ class LondonTfLSensor(SensorEntity):
                     _LOGGER.warning('There was no reply from TfL servers.')
                     self._state = 'Cannot reach TfL'
                     return
-                result = json.loads(result)
+                try:
+                    result = json.loads(result)
+                except Exception:
+                    _LOGGER.warning('Failed to interpret received %s', 'JSON.', exc_info=1)
+                    self._state = 'Cannot interpret JSON from TfL'
+                    return
             except OSError:
                 _LOGGER.warning('Something broke.')
                 self._state = 'Cannot reach TfL'
                 return
             except Exception:
-                _LOGGER.warning('Failed to interpret received %s', 'JSON.', exc_info=1)
-                self._state = 'Cannot interpret JSON from TfL'
+                _LOGGER.warning('Error in TfL data fetch.', exc_info=1)
+                self._state = 'Cannot reach TfL'
                 return
             self._tfl_data.populate(result, self.filter_platform)
 
@@ -204,6 +203,7 @@ class LondonTfLSensor(SensorEntity):
         attributes = {}
         attributes['last_refresh'] = self._tfl_data.get_last_update()
 
+        # DEFENSIVE: If tfl_data is empty, return attributes with just last_refresh for stability
         if self._tfl_data.is_empty():
             return attributes
 
@@ -247,3 +247,18 @@ class LondonTfLSensor(SensorEntity):
         attributes['data'] = data
 
         return attributes
+
+    # CHANGED/DEFENSIVE: Add defensive property for legacy integrations that call .native_value
+    @property
+    def native_value(self):
+        """
+        DEFENSIVE: If the state is missing (e.g. if no API result or parsing failed), return 'unknown'
+        and log this at debug. This prevents KeyError and makes debugging possible.
+        """
+        if self._state is None:
+            _LOGGER.debug(
+                "[london_tfl] native_value: _state is None for sensor %s (station %s, line %s)",
+                self._name, self.station, self.line
+            )
+            return "unknown"
+        return self._state
